@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.borferkic.katana",
+  "name": "Sound BlasterX Katana",
+  "version": "0.1.0",
+  "author": "Boris SdK",
+  "license": "MIT",
+  "description": "Keep the volume of a Creative Sound BlasterX Katana in sync with the PC and pick its stored sound profiles from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sound BlasterX Katana",
+    "description": "Volume bar in sync with the system volume, and the Katana's stored sound profiles.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "syncVolume": true,
+      "announceProfile": true
+    },
+    "schema": [
+      {
+        "key": "syncVolume",
+        "type": "boolean",
+        "label": "Sync volume",
+        "description": "Keep the system volume and the Katana's volume bar together, in both directions (each bar point is 2%).",
+        "defaultValue": true
+      },
+      {
+        "key": "announceProfile",
+        "type": "boolean",
+        "label": "Announce profile changes",
+        "description": "Show an on-screen message when the profile changes on the speaker.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

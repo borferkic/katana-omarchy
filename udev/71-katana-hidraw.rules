@@ -1,0 +1,2 @@
+# Let the logged-in user talk to the Creative Sound BlasterX Katana (USB 041e:3247).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="041e", ATTRS{idProduct}=="3247", TAG+="uaccess"
