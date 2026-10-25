@@ -32,11 +32,11 @@ Item {
     var snapped = Math.round(v / stepSize) * stepSize
     return Math.max(from, Math.min(to, snapped))
   }
+  // Reports the wanted value and leaves it to the owner to set `value`: assigning it here would
+  // break the owner's binding, and the slider would stop following presets and the speaker.
   function edit(v) {
     var next = clampStep(v)
-    if (next === value) return
-    value = next
-    moved(next)
+    if (next !== value) moved(next)
   }
 
   Rectangle {

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.borferkic.katana",
   "name": "Sound BlasterX Katana",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Boris SdK",
   "license": "MIT",
-  "description": "Keep the volume of a Creative Sound BlasterX Katana in sync with the PC and pick its stored sound profiles from the bar.",
+  "description": "Keep the volume of a Creative Sound BlasterX Katana in sync with the PC, pick its stored sound profiles, and edit the equalizer and enhancements of its Personal profile.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Sound BlasterX Katana",
-    "description": "Volume bar in sync with the system volume, and the Katana's stored sound profiles.",
+    "description": "Volume bar in sync with the system volume, stored sound profiles, and the equalizer and enhancements of the Personal profile.",
     "category": "Audio",
     "allowMultiple": false,
     "defaultSection": "right",

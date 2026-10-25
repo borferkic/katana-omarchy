@@ -6,13 +6,17 @@ import qs.Commons
 import qs.Commons as Commons
 import "Presets.js" as Presets
 
-// Sound BlasterX Katana widget: a bar icon and a popup with the volume bar, the Katana's
-// stored sound profiles (as icons) and a 10-band equalizer with presets and one personal profile.
+// Sound BlasterX Katana widget: a bar icon and a popup with the volume bar, the Katana's stored
+// sound profiles (as icons), and the equalizer and enhancements of the profile in use.
 //
-// bin/katana.py runs as a long-lived `daemon` that keeps the system volume and the
-// Katana's bar in sync, runs the equalizer filter and reports changes made on the speaker,
-// one JSON line each. Commands (profile, volume, eq, status) are short calls to the same
-// script, queued so they never overlap.
+// The equalizer and the enhancements live in the speaker. They can be edited only in the Personal
+// profile; in the others the panel shows what that profile holds, read-only, so the factory
+// profiles are never changed by accident.
+//
+// bin/katana.py runs as a long-lived `daemon` that keeps the system volume and the Katana's bar
+// in sync, learns what each profile holds, and reports changes made on the speaker, one JSON line
+// each. Commands (profile, volume, hw, learn, status) are short calls to the same script, queued
+// so they never overlap.
 //
 // Bar button: left click opens the panel, right click re-reads.
 // Panel: Esc closes, r refreshes. Equalizer sliders: drag, scroll, or double-click to reset.
@@ -40,33 +44,68 @@ Panel {
   readonly property string icon: String.fromCodePoint(0xF04C3)
   readonly property int barMax: 50
 
-  // One icon per stored profile, chosen from what each profile switches on in the speaker:
-  // 0 tuned EQ, 1 surround, 2 custom EQ, 3 crystalizer, 4 smart volume (night), 5 personal.
-  readonly property var profileIcons: [0xF001, 0xF025, 0xF1DE, 0xF219, 0xF186, 0xF007]
+  // The stored profiles follow the order of Creative's own list: 0 Neutral, 1 Gaming, 2 Concert,
+  // 3 Cinema, 4 Night and 5 Personal. The speaker does not report which is which, so this is the
+  // one table to change if a slot turns out to hold something else.
+  // Icons: balance, gamepad, music note, film strip, moon, user.
+  readonly property var profileIcons: [0xF24E, 0xF11B, 0xF001, 0xF008, 0xF186, 0xF007]
+  readonly property int personalProfile: 5
   function profileGlyph(n) { return String.fromCodePoint(profileIcons[n] || 0xF1DE) }
+  function profileName(n) { return strings.t("profile." + n) }
 
   // ---- state --------------------------------------------------------------
   property var rep: null
   property string errorCode: ""
   property var queue: []
   property bool daemonBusy: false
-
-  readonly property var flatCurve: ({ preamp: 0, bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] })
-  property var eq: ({ on: false, preset: "flat", preamp: 0, bands: flatCurve.bands, custom: flatCurve })
-  readonly property bool eqEditing: eqDebounce.running || sliderDragging
-  property bool sliderDragging: false
+  property bool learning: false
 
   readonly property int profile: rep && rep.profile !== null && rep.profile !== undefined ? rep.profile : -1
   readonly property int barLevel: rep && rep.bar !== null && rep.bar !== undefined ? rep.bar : -1
+  readonly property bool personal: profile === personalProfile
+  readonly property int learned: rep && rep.learned ? rep.learned : 0
   readonly property string errorText: errorCode === "" ? ""
     : (strings.t("error." + errorCode) !== "error." + errorCode ? strings.t("error." + errorCode) : strings.t("error.generic"))
 
+  // What the speaker holds for the profile in use, as the daemon learned it.
+  readonly property var deviceProfile: rep && rep.deviceProfiles && rep.deviceProfiles[String(profile)] ? rep.deviceProfiles[String(profile)] : null
+  // While the user edits, `edit` ({ on, preamp, bands }) and `fxEdit` ({ name: bool }) hold the
+  // values on screen until the speaker's own report arrives; then they are dropped.
+  property var edit: null
+  property var fxEdit: ({})
+  property var pending: ({})
+
+  function number(v) { return v === null || v === undefined ? 0 : v }
+  function deviceBand(i) { return deviceProfile ? Math.max(-12, Math.min(12, number(deviceProfile.bands[i]))) : 0 }
+  readonly property bool eqOn: edit ? edit.on : (deviceProfile !== null && deviceProfile.eqOn === true)
+  readonly property real preamp: edit ? edit.preamp : (deviceProfile ? number(deviceProfile.preamp) : 0)
+  function bandValue(i) { return edit ? edit.bands[i] : deviceBand(i) }
+  function effectOn(name) {
+    if (fxEdit[name] !== undefined) return fxEdit[name]
+    var v = deviceProfile ? deviceProfile.effects[name] : null
+    return v !== null && v !== undefined && v > 0
+  }
+
+  // The preset whose bands match what is on screen, or "custom".
+  readonly property string presetKey: {
+    for (var p = 0; p < Presets.list.length; p++) {
+      var match = true
+      for (var i = 0; i < 10 && match; i++) match = Math.abs(bandValue(i) - Presets.list[p].bands[i]) < 0.01
+      if (match) return Presets.list[p].key
+    }
+    return "custom"
+  }
+  readonly property var presetOptions: {
+    var o = Presets.list.map(function (p) { return { value: p.key, label: strings.t("preset." + p.key) } })
+    o.push({ value: "custom", label: strings.t("preset.custom") })
+    return o
+  }
+
   // ---- commands -----------------------------------------------------------
   function run(args) {
-    // A newer read supersedes one still waiting; a newer equalizer write replaces an older one.
-    var supersede = args[0] === "status" || (args[0] === "eq" && args.length > 1)
-    if (supersede) {
-      queue = queue.filter(function (q) { return !(q[0] === args[0] && q.length === args.length) })
+    // A newer read supersedes one still waiting.
+    if (args[0] === "status") {
+      queue = queue.filter(function (q) { return q[0] !== "status" })
     }
     queue.push(args)
     pump()
@@ -80,11 +119,16 @@ Panel {
   }
 
   function handle(args, res) {
-    if (!res.ok) { errorCode = res.error || "generic"; return }
+    if (args[0] === "learn") { learning = false; refreshTimer.restart() }
+    if (args[0] === "hw") settleTimer.restart()
+    if (!res.ok) {
+      errorCode = res.error || "generic"
+      if (args[0] === "hw") { edit = null; fxEdit = ({}) }
+      return
+    }
     errorCode = ""
     if (args[0] === "status") rep = res
-    else if (args[0] === "eq") { if (args.length === 1 && !eqEditing) eq = res }
-    else refreshTimer.restart()
+    else if (args[0] !== "hw") refreshTimer.restart()
   }
 
   function patch(obj) {
@@ -94,51 +138,84 @@ Panel {
     rep = n
   }
 
-  function refresh() { run(["status"]); run(["eq"]) }
-  function setProfile(n) { patch({ profile: n }); run(["profile", String(n)]) }
+  function refresh() { run(["status"]) }
+  function setProfile(n) { edit = null; fxEdit = ({}); patch({ profile: n }); run(["profile", String(n)]) }
   function setBar(n) { patch({ bar: n }); run(["volume", String(n)]) }
+  function learnProfiles() { learning = true; run(["learn"]) }
 
-  // ---- equalizer ----------------------------------------------------------
-  function eqWith(fields) {
-    var n = {}
-    for (var k in eq) n[k] = eq[k]
-    for (var p in fields) n[p] = fields[p]
-    return n
+  // ---- equalizer and enhancements (Personal profile only) ---------------------
+  function editCopy() {
+    return edit ? { on: edit.on, preamp: edit.preamp, bands: edit.bands.slice() }
+      : { on: eqOn, preamp: preamp, bands: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(function (i) { return bandValue(i) }) }
   }
-  function eqSave(fields) { run(["eq", "set", JSON.stringify(fields)]) }
+
+  // Writes are merged and sent together once the sliders pause.
+  function queueWrite(fields) {
+    var n = {}
+    for (var k in pending) n[k] = pending[k]
+    for (var f in fields) {
+      if (f === "bands" || f === "effects") {
+        var merged = {}
+        for (var a in n[f]) merged[a] = n[f][a]
+        for (var b in fields[f]) merged[b] = fields[f][b]
+        n[f] = merged
+      } else n[f] = fields[f]
+    }
+    pending = n
+    writeTimer.restart()
+  }
+  function flushWrite() {
+    writeTimer.stop()
+    var request = pending
+    pending = ({})
+    if (Object.keys(request).length > 0) run(["hw", JSON.stringify(request)])
+  }
 
   function setEqOn(on) {
-    eq = eqWith({ on: on })
-    eqSave({ on: on })
+    if (!personal) return
+    var e = editCopy(); e.on = on; edit = e
+    queueWrite({ eqOn: on })
   }
-
-  function applyPreset(key) {
-    var c = key === "custom" ? eq.custom : Presets.byKey(key)
-    eq = eqWith({ preset: key, preamp: c.preamp, bands: c.bands.slice() })
-    eqSave({ preset: key, preamp: c.preamp, bands: c.bands })
-  }
-
-  // index -1 is the preamp. Any manual move lands in the one personal profile.
   function eqMove(index, value) {
-    var bands = eq.bands.slice()
-    var preamp = eq.preamp
-    if (index < 0) preamp = value
-    else bands[index] = value
-    eq = eqWith({ preset: "custom", preamp: preamp, bands: bands, custom: { preamp: preamp, bands: bands.slice() } })
-    eqDebounce.restart()
+    if (!personal) return
+    var e = editCopy()
+    var fields = {}
+    if (index < 0) { e.preamp = value; fields.preamp = value }
+    else { e.bands[index] = value; fields.bands = {}; fields.bands[index] = value }
+    edit = e
+    queueWrite(fields)
   }
-  function eqFlush() {
-    eqDebounce.stop()
-    eqSave({ preset: "custom", preamp: eq.preamp, bands: eq.bands, custom: eq.custom })
+  function applyPreset(key) {
+    if (!personal || key === "custom") return
+    var p = Presets.byKey(key)
+    var bands = {}
+    for (var i = 0; i < 10; i++) bands[i] = p.bands[i]
+    edit = { on: true, preamp: p.preamp, bands: p.bands.slice() }
+    queueWrite({ eqOn: true, preamp: p.preamp, bands: bands })
+  }
+  function setEffect(name, on) {
+    if (!personal) return
+    var f = {}
+    for (var k in fxEdit) f[k] = fxEdit[k]
+    f[name] = on
+    fxEdit = f
+    var effects = {}
+    effects[name] = on
+    queueWrite({ effects: effects })
   }
 
-  readonly property var presetOptions: {
-    var o = Presets.list.map(function (p) { return { value: p.key, label: strings.t("preset." + p.key) } })
-    o.push({ value: "custom", label: strings.t("preset.custom") })
-    return o
+  Timer { id: writeTimer; interval: 100; onTriggered: root.flushWrite() }
+  // Back to the speaker's own values once it has had time to report the change.
+  Timer {
+    id: settleTimer
+    interval: 1600
+    onTriggered: {
+      if (root.pending && Object.keys(root.pending).length > 0) return
+      root.edit = null
+      root.fxEdit = ({})
+      root.run(["status"])
+    }
   }
-
-  Timer { id: eqDebounce; interval: 100; onTriggered: root.eqFlush() }
 
   Process {
     id: proc
@@ -169,10 +246,13 @@ Panel {
         if (!ev) return
         root.daemonBusy = ev.event === "busy"
         if (ev.event === "bar") root.patch({ bar: ev.level })
+        else if (ev.event === "profileState") { if (!root.edit) root.run(["status"]) }
         else if (ev.event === "profile") {
+          root.edit = null
+          root.fxEdit = ({})
           root.patch({ profile: ev.profile })
           if (root.setting("announceProfile", true) === true)
-            Quickshell.execDetached(["omarchy-osd", "-i", root.icon, "-m", strings.t("announce").arg(root.profileGlyph(ev.profile))])
+            Quickshell.execDetached(["omarchy-osd", "-i", root.icon, "-m", strings.t("announce").arg(root.profileName(ev.profile)).arg(root.profileGlyph(ev.profile))])
         }
       }
     }
@@ -363,21 +443,60 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               cursorRing: false
               trackHeight: Style.space(18)
-              checked: root.eq.on
+              enabled: root.personal
+              checked: root.eqOn
               foreground: root.foreground
-              onToggled: root.setEqOn(!root.eq.on)
+              onToggled: root.setEqOn(!root.eqOn)
             }
           }
         }
 
         Dropdown {
+          visible: root.personal
           width: parent.width
           showLabel: false
           fontFamily: root.fontFamily
           foreground: root.foreground
           options: root.presetOptions
-          value: root.eq.preset
+          value: root.presetKey
           onChanged: function (v) { root.applyPreset(v) }
+        }
+
+        // Outside the Personal profile: why the sliders are locked.
+        Column {
+          visible: !root.personal || root.learned < 6
+          width: parent.width
+          spacing: Style.space(6)
+          Text {
+            visible: !root.personal
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: strings.t("eq.locked")
+            color: Qt.darker(root.foreground, 1.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Text {
+            visible: root.learned < 6
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: strings.t("eq.unknown")
+            color: Qt.darker(root.foreground, 1.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+          Button {
+            visible: root.learned < 6
+            text: root.learning ? strings.t("eq.reading") : strings.t("eq.read")
+            enabled: !root.learning
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            bordered: true
+            onClicked: root.learnProfiles()
+          }
         }
 
         Item {
@@ -419,10 +538,10 @@ Panel {
                   anchors.horizontalCenter: parent.horizontalCenter
                   height: eqArea.sliderHeight
                   foreground: root.foreground
-                  dimmed: !root.eq.on
-                  value: isPreamp ? root.eq.preamp : root.eq.bands[index - 1]
-                  onMoved: function (v) { root.sliderDragging = true; root.eqMove(index - 1, v) }
-                  onReleased: function (v) { root.sliderDragging = false; root.eqFlush() }
+                  enabled: root.personal
+                  dimmed: !root.eqOn
+                  value: isPreamp ? root.preamp : root.bandValue(index - 1)
+                  onMoved: function (v) { root.eqMove(index - 1, v) }
                 }
                 Text {
                   width: parent.width
@@ -436,6 +555,30 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        // ---- enhancements ----
+        PanelSectionHeader {
+          text: strings.t("enhancements").toUpperCase()
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+        Repeater {
+          model: ["dialogPlus", "surround", "smartVolume"]
+          delegate: Toggle {
+            required property string modelData
+            width: column.width
+            enabled: root.personal
+            opacity: root.personal ? 1 : 0.55
+            label: strings.t("fx." + modelData)
+            description: strings.t("fx." + modelData + ".desc")
+            checked: root.effectOn(modelData)
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.setEffect(modelData, !checked)
           }
         }
       }

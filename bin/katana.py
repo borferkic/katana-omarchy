@@ -3,21 +3,21 @@
 
     katana.py status          JSON report of what the plugin shows
     katana.py profile N       select stored profile N (0..5)
+    katana.py learn           step through the six profiles twice so the daemon learns what each holds
     katana.py volume N        set the PC volume to bar level N (0..50, 2% each)
-    katana.py eq              JSON with the equalizer settings
-    katana.py eq set JSON     merge fields (on, preset, preamp, bands, custom) into the equalizer settings
-    katana.py daemon          keep PC volume and the Katana's bar in sync and run the equalizer;
-                              one JSON event per line
+    katana.py hw JSON         write the equalizer and enhancements of the Personal profile (see hw_write)
+    katana.py daemon          keep PC volume and the Katana's bar in sync and learn what each profile
+                              holds; one JSON event per line
 
 The Katana reports its bar (0..50) as `5a 23 03 00 <level>` over HID. Buttons are reported
 on interface 3, changes made from the PC on interface 4. The bar follows the ALSA
 "Speakers" control (0..128) through a non-linear curve, measured with a sweep (SPEAKERS).
 PipeWire's own software gain is pinned to 1.0 so loudness is applied once, by the Katana.
 
-The equalizer is a PipeWire filter-chain (preamp + 10 bands) that the daemon runs as a child
-`pipewire -c` process in front of the Katana and retunes live; settings live in eq.json.
+The speaker keeps its own equalizer (preamp + 10 bands) and enhancements per profile. They are
+registers read as `5a 11` frames and written with `5a 12 07 01 <page> <register> <float32>`; a write
+lands in the active profile and the speaker keeps it. Only the Personal profile is ever written.
 """
-import ctypes
 import fcntl
 import glob
 import json
@@ -25,6 +25,7 @@ import os
 import re
 import select
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ CARD = "Katana"
 BAR_MAX = 50
 SETTLE = 0.05
 PROFILES = 6
+PERSONAL_PROFILE = 5  # the only profile the plugin writes to
 
 # bar level -> (first, last) value of the ALSA "Speakers" control that yields it
 SPEAKERS = {
@@ -49,12 +51,6 @@ SPEAKERS = {
     47: (126, 126), 49: (127, 127), 50: (128, 128),
 }
 
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "katana-omarchy")
-EQ_FILE = os.path.join(CONFIG_DIR, "eq.json")
-EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-EQ_NODE = "katana_eq_input"
-EQ_LIMIT = 12.0
-
 STATE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "katana-omarchy")
 STATE = os.path.join(STATE_DIR, "state.json")
 
@@ -62,6 +58,19 @@ lock = threading.Lock()
 timer = None
 level = None
 node_id = None
+
+# What the speaker holds per profile. It reports a profile as `5a 11 ...` frames carrying only the
+# registers that changed since the previous profile, as (page, register, float32) entries, so the
+# daemon applies them to a running model and keeps a snapshot per profile in state.json.
+device_regs = {}
+current_profile = None
+snapshot_timer = None
+EQ_ON = "9609"
+EQ_BANDS = ["96%02x" % (0x0B + i) for i in range(10)]
+EQ_PREAMP = "960a"
+EQ_LIMIT = 12.0
+EFFECTS = {"crystalizer": "9601", "surround": "9671", "smartVolume": "9670", "dialogPlus": "9672"}
+WRITABLE_EFFECTS = {"dialogPlus": "9672", "surround": "9671", "smartVolume": "9670"}
 
 
 def run(*cmd):
@@ -80,12 +89,23 @@ def load_state():
         return {}
 
 
-def save_state(**values):
-    state = load_state()
-    state.update(values)
+def update_state(change):
+    """Read-modify-write state.json under a lock shared by the daemon and the commands.
+
+    The file is replaced atomically, so a reader never sees it half written."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE, "w") as f:
-        json.dump(state, f)
+    with open(os.path.join(STATE_DIR, "state.lock"), "w") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        state = load_state()
+        change(state)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+
+
+def save_state(**values):
+    update_state(lambda state: state.update(values))
 
 
 def hidraw_paths():
@@ -181,9 +201,34 @@ def on_volume_event():
     timer.start()
 
 
+def apply_frame(data):
+    body = data[5:3 + data[2]]
+    with lock:
+        for i in range(0, len(body) - 5, 6):
+            if body[i] >= 0x95:
+                device_regs["%02x%02x" % (body[i], body[i + 1])] = round(struct.unpack("<f", body[i + 2:i + 6])[0], 3)
+
+
+def take_snapshot():
+    with lock:
+        if current_profile is None:
+            return
+        number, regs = current_profile, dict(device_regs)
+    update_state(lambda state: state.setdefault("profiles", {}).__setitem__(str(number), regs))
+    emit(event="profileState", profile=number)
+
+
+def schedule_snapshot():
+    global snapshot_timer
+    if snapshot_timer:
+        snapshot_timer.cancel()
+    snapshot_timer = threading.Timer(0.5, take_snapshot)
+    snapshot_timer.start()
+
+
 def follow(path, interface):
     """Read the Katana's HID reports; `5a 23 03 00 NN` is the bar, `5a 1a 02 02 NN` the profile."""
-    global level
+    global level, current_profile
     with open(path, "rb", buffering=0) as dev:
         while True:
             data = dev.read(64)
@@ -203,8 +248,13 @@ def follow(path, interface):
             elif data[:4] == b"\x5a\x1a\x02\x02":
                 profile = data[4] & 0x7F
                 if profile < PROFILES:
+                    with lock:
+                        current_profile = profile
                     save_state(profile=profile)
                     emit(event="profile", profile=profile)
+            elif data[:2] == b"\x5a\x11" and interface == 4:
+                apply_frame(data)
+                schedule_snapshot()
 
 
 def reader(interface):
@@ -234,175 +284,63 @@ def clamp_db(value):
         return 0.0
 
 
-def clean_curve(curve):
-    curve = curve if isinstance(curve, dict) else {}
-    bands = curve.get("bands") if isinstance(curve.get("bands"), list) else []
-    bands = [clamp_db(b) for b in bands[:len(EQ_FREQS)]]
-    return {"preamp": clamp_db(curve.get("preamp")), "bands": bands + [0.0] * (len(EQ_FREQS) - len(bands))}
+def write_registers(writes):
+    """Write (register, float) pairs to the speaker's active profile.
 
-
-def load_eq():
+    Returns None when every write was acknowledged (`5a 02 02 12 00`), else an error code."""
+    path = hidraw_paths().get(4)
+    if not path:
+        return "not_found"
     try:
-        with open(EQ_FILE) as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        raw = {}
-    raw = raw if isinstance(raw, dict) else {}
-    cfg = clean_curve(raw)
-    cfg["on"] = raw.get("on") is True
-    cfg["preset"] = raw.get("preset") if isinstance(raw.get("preset"), str) else "flat"
-    cfg["custom"] = clean_curve(raw.get("custom"))
-    return cfg
-
-
-def save_eq(changes):
-    """Merge `changes` into eq.json and write it atomically; the daemon notices and applies it."""
-    cfg = load_eq()
-    if isinstance(changes, dict):
-        if "on" in changes:
-            cfg["on"] = changes["on"] is True
-        if isinstance(changes.get("preset"), str):
-            cfg["preset"] = changes["preset"][:40]
-        if "preamp" in changes or "bands" in changes:
-            cfg.update(clean_curve({"preamp": changes.get("preamp", cfg["preamp"]), "bands": changes.get("bands", cfg["bands"])}))
-        if "custom" in changes:
-            cfg["custom"] = clean_curve(changes["custom"])
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = EQ_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cfg, f)
-    os.replace(tmp, EQ_FILE)
-    return cfg
-
-
-def eq_config(sink, cfg):
-    """A `pipewire -c` config with a stereo sink (preamp, then one biquad per band) feeding `sink`."""
-    nodes = ["{ type = builtin name = pre label = linear control = { Mult = %.5f Add = 0.0 } }" % (10 ** (cfg["preamp"] / 20))]
-    for i, (freq, gain) in enumerate(zip(EQ_FREQS, cfg["bands"]), 1):
-        label = "bq_lowshelf" if i == 1 else ("bq_highshelf" if i == len(EQ_FREQS) else "bq_peaking")
-        q = 0.707 if label != "bq_peaking" else 1.41
-        nodes.append("{ type = builtin name = b%d label = %s control = { Freq = %d Q = %.3f Gain = %.2f } }" % (i, label, freq, q, gain))
-    links = ['{ output = "pre:Out" input = "b1:In" }']
-    links += ['{ output = "b%d:Out" input = "b%d:In" }' % (i, i + 1) for i in range(1, len(EQ_FREQS))]
-    return """context.properties = { log.level = 2 }
-context.spa-libs = { audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }
-context.modules = [
-  { name = libpipewire-module-rt args = { nice.level = -11 } flags = [ ifexists nofail ] }
-  { name = libpipewire-module-protocol-native }
-  { name = libpipewire-module-client-node }
-  { name = libpipewire-module-adapter }
-  { name = libpipewire-module-filter-chain args = {
-      node.description = "Katana EQ"
-      media.name = "Katana EQ"
-      filter.graph = {
-        nodes = [ %s ]
-        links = [ %s ]
-        inputs = [ "pre:In" ]
-        outputs = [ "b%d:Out" ]
-      }
-      audio.channels = 2
-      audio.position = [ FL FR ]
-      capture.props = { node.name = "%s" media.class = Audio/Sink node.description = "Katana EQ" }
-      playback.props = { node.name = "katana_eq_input.playback" node.passive = true target.object = "%s" }
-  } }
-]
-""" % (" ".join(nodes), " ".join(links), len(EQ_FREQS), EQ_NODE, sink)
-
-
-def eq_node_id():
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    except PermissionError:
+        return "permission"
     try:
-        nodes = json.loads(run("pw-dump") or "[]")
-    except ValueError:
-        return None
-    for node in nodes:
-        props = node.get("info", {}).get("props", {})
-        if props.get("node.name") == EQ_NODE and props.get("media.class") == "Audio/Sink":
-            return str(node["id"])
+        for register, value in writes:
+            frame = bytes([0x5A, 0x12, 0x07, 0x01, int(register[:2], 16), int(register[2:], 16)]) + struct.pack("<f", value)
+            os.write(fd, frame.ljust(64, b"\0"))
+            acknowledged = False
+            end = time.time() + 0.6
+            while time.time() < end and not acknowledged:
+                if select.select([fd], [], [], 0.05)[0]:
+                    data = os.read(fd, 64)
+                    if data[:4] == b"\x5a\x02\x02\x12":
+                        if data[4] != 0:
+                            return "rejected"
+                        acknowledged = True
+            if not acknowledged:
+                return "no_reply"
+    finally:
+        os.close(fd)
+    return None
 
 
-def eq_tune(nid, cfg):
-    params = ['"pre:Mult"', "%.5f" % (10 ** (cfg["preamp"] / 20))]
-    for i, gain in enumerate(cfg["bands"], 1):
-        params += ['"b%d:Gain"' % i, "%.2f" % gain]
-    run("pw-cli", "s", nid, "Props", "{ params = [ %s ] }" % " ".join(params))
+def hw_write(request):
+    """Apply {"eqOn": bool, "preamp": dB, "bands": {index: dB}, "effects": {name: bool}}.
 
-
-def eq_route(to_eq):
-    """Make the EQ sink the default output (or hand the default back to the Katana)."""
-    sink, default = katana_sink(), run("pactl", "get-default-sink").strip()
-    if to_eq and default == sink:
-        run("pactl", "set-default-sink", EQ_NODE)
-    elif not to_eq and default == EQ_NODE and sink:
-        run("pactl", "set-default-sink", sink)
-
-
-eq_child = None
-
-
-def die_with_parent():
-    """Child-side hook: have the kernel stop the filter if the daemon is killed (PR_SET_PDEATHSIG)."""
-    ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)
-
-
-def eq_conf_path():
-    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or STATE_DIR, "katana-eq.conf")
-
-
-def reap_stale_filters():
-    """Stop filters left behind by an earlier daemon that was killed before it could clean up."""
-    conf = eq_conf_path()
-    for entry in glob.glob("/proc/[0-9]*/cmdline"):
-        try:
-            with open(entry, "rb") as f:
-                args = f.read().split(b"\0")
-        except OSError:
-            continue
-        if len(args) > 2 and os.path.basename(args[0].decode(errors="replace")) == "pipewire" and args[1] == b"-c" and args[2].decode(errors="replace") == conf:
-            try:
-                os.kill(int(entry.split("/")[2]), signal.SIGTERM)
-            except OSError:
-                pass
-
-
-def eq_shutdown():
-    """Hand the default output back to the Katana and stop the filter."""
-    global eq_child
-    if eq_child:
-        eq_route(False)
-        eq_child.terminate()
-        eq_child = None
-
-
-def eq_manager():
-    global eq_child
-    child, applied, routed = None, None, False
-    conf = eq_conf_path()
-    while True:
-        cfg = load_eq()
-        sink = katana_sink()
-        want = cfg["on"] and sink is not None
-        if child and child.poll() is not None:
-            child, applied, routed = None, None, False
-        if want and child is None:
-            with open(conf, "w") as f:
-                f.write(eq_config(sink, cfg))
-            child = eq_child = subprocess.Popen(["pipewire", "-c", conf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=die_with_parent)
-            applied = None
-        elif not want and child:
-            eq_route(False)
-            child.terminate()
-            child.wait()
-            child = eq_child = None
-            applied, routed = None, False
-        if child:
-            nid = eq_node_id()
-            if nid and (applied != (nid, cfg["preamp"], tuple(cfg["bands"]))):
-                eq_tune(nid, cfg)
-                applied = (nid, cfg["preamp"], tuple(cfg["bands"]))
-            if nid and not routed:
-                eq_route(True)
-                routed = True
-        time.sleep(0.25)
+    Refused unless the Personal profile is the active one, so the factory profiles stay untouched.
+    Bands go first and the on/off switch after them, so a preset never sounds half applied."""
+    if load_state().get("profile") != PERSONAL_PROFILE:
+        return {"ok": False, "error": "not_personal"}
+    if not isinstance(request, dict):
+        return {"ok": False, "error": "usage"}
+    writes = []
+    bands = request.get("bands")
+    if isinstance(bands, dict):
+        for key, value in bands.items():
+            if str(key).isdigit() and int(key) < len(EQ_BANDS):
+                writes.append((EQ_BANDS[int(key)], clamp_db(value)))
+    if "preamp" in request:
+        writes.append((EQ_PREAMP, clamp_db(request["preamp"])))
+    if "eqOn" in request:
+        writes.append((EQ_ON, 1.0 if request["eqOn"] is True else 0.0))
+    effects = request.get("effects")
+    if isinstance(effects, dict):
+        for name, on in effects.items():
+            if name in WRITABLE_EFFECTS:
+                writes.append((WRITABLE_EFFECTS[name], 2.0 if on is True else 0.0))
+    error = write_registers(writes)
+    return {"ok": True} if error is None else {"ok": False, "error": error}
 
 
 def daemon():
@@ -414,18 +352,15 @@ def daemon():
     except OSError:
         emit(event="busy")
         return
+    global current_profile
+    current_profile = load_state().get("profile")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    reap_stale_filters()
     for interface in (3, 4):
         threading.Thread(target=reader, args=(interface,), daemon=True).start()
-    threading.Thread(target=eq_manager, daemon=True).start()
     time.sleep(1)
     pc_to_bar()
     emit(event="ready")
-    try:
-        watch_volume()
-    finally:
-        eq_shutdown()
+    watch_volume()
 
 
 def select_profile(number):
@@ -454,11 +389,37 @@ def select_profile(number):
     return {"ok": False, "error": "no_reply"}
 
 
+def profile_summary(regs):
+    def value(register):
+        return regs.get(register)
+    return {
+        "eqOn": None if value(EQ_ON) is None else value(EQ_ON) >= 0.5,
+        "preamp": value(EQ_PREAMP),
+        "bands": [value(r) for r in EQ_BANDS],
+        "effects": {name: value(r) for name, r in EFFECTS.items()},
+    }
+
+
+def learn():
+    """Select every profile twice, so each one's changes are seen after the previous profile's."""
+    start = load_state().get("profile")
+    for _ in range(2):
+        for number in range(PROFILES):
+            select_profile(number)
+            time.sleep(0.9)
+    restored = start if isinstance(start, int) and 0 <= start < PROFILES else 0
+    select_profile(restored)
+    return {"ok": True, "restored": restored}
+
+
 def status():
     paths = hidraw_paths()
     state = load_state()
     sink = katana_sink()
+    profiles = {n: profile_summary(regs) for n, regs in state.get("profiles", {}).items()}
     return {
+        "deviceProfiles": profiles,
+        "learned": len(profiles),
         "ok": True,
         "present": bool(paths),
         "readable": bool(paths) and all(os.access(p, os.R_OK | os.W_OK) for p in paths.values()),
@@ -475,14 +436,16 @@ def main(argv):
             daemon()
         elif command == "status":
             print(json.dumps(status()))
-        elif command == "eq":
-            if len(argv) > 3 and argv[2] == "set":
-                cfg = save_eq(json.loads(argv[3]))
-            else:
-                cfg = load_eq()
-            print(json.dumps(dict(cfg, ok=True)))
+        elif command == "hw" and len(argv) > 2:
+            try:
+                request = json.loads(argv[2])
+            except ValueError:
+                request = None
+            print(json.dumps(hw_write(request)))
         elif command == "profile" and len(argv) > 2 and argv[2].isdigit() and int(argv[2]) < PROFILES:
             print(json.dumps(select_profile(int(argv[2]))))
+        elif command == "learn":
+            print(json.dumps(learn()))
         elif command == "volume" and len(argv) > 2 and argv[2].isdigit():
             sink = katana_sink()
             if sink:
