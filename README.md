@@ -36,6 +36,29 @@ lets you pick the Katana's stored sound profiles from a panel. No Windows, no Cr
 
 then `omarchy bar move io.github.borferkic.katana --section right`.
 
+## Remove
+
+    omarchy plugin remove io.github.borferkic.katana
+
+That stops the volume sync and the equalizer, and gives the default output back to the Katana.
+Two things stay on purpose, delete them if you want a clean system:
+
+    sudo rm /etc/udev/rules.d/71-katana-hidraw.rules   # the HID access rule from Install
+    rm -r ~/.config/katana-omarchy ~/.cache/katana-omarchy   # your equalizer settings and cached state
+
+## What it changes on your system
+
+Only while the plugin is enabled, and only for the Katana:
+
+- Volume sync sets the system volume of the Katana's sink and the speaker's own volume (the ALSA
+  `Speakers` control) so the two match, and pins PipeWire's software gain on that sink to 1.0.
+  Turn it off with the `syncVolume` setting.
+- Selecting a profile writes it to the speaker, which keeps it.
+- Turning the equalizer on starts a PipeWire filter and makes it the default output, only if the
+  Katana was the default. Turning it off, or stopping the plugin, restores the Katana.
+- It writes `~/.config/katana-omarchy/eq.json` and `~/.cache/katana-omarchy/state.json`, and
+  nothing else in your configuration.
+
 ## Usage
 
 | Input | Action |
